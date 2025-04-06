@@ -23,6 +23,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.embd = config.n_embd 
         self.c_proj = nn.Linear(config.n_embd,config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
         self.register_buffer("bias",torch.tril(torch.ones(config.block_size,config.block_size))
                              .view(1,1,config.block_size,config.block_size))
 
@@ -36,7 +37,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
         q = q.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
         v = v.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
-        att = (q @ k.transpose(-2,-1))**(1.0/math.sqrt(k.size(-1))) # where k.size(-1) is the head dimension 
+        att = (q @ k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1))) # where k.size(-1) is the head dimension 
         # shape of attention will be (B, nh, T, T)
         att = att.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
         att = F.softmax(att,dim=-1)
@@ -53,6 +54,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd,4*config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd,config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
     def forward(self,x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -63,12 +65,12 @@ class Block(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)     
+        self.attn = CausalSelfAttention(config)  
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     
     def forward(self,x):
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x))  
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -83,8 +85,25 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias = False)
+
+        #weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init prameters
+        self.apply(self._init_weights)
+
+    def _init_weights(self,module):
+        if isinstance(module,nn.Linear):
+            std = 0.02
+            if hasattr(module,'GPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5 # we have 2* since we added residue 2 times (one for attention and another for MLP)
+            torch.nn.init.normal_(module.weight,mean=0.0,std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.02)
     
-    def forward(self,idx):
+    def forward(self,idx,targets = None):
         #idx is of shape (B,T)
         B,T = idx.size()
         assert T <= self.config.block_size, f"Sequence length cannot be more than block size"
@@ -98,35 +117,78 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B,T,vocal_size)
-        return logits
-        
+        loss = None
+        if targets is not None:
+            logits = logits.view(B*T,-1)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits,targets)
+        return logits,loss
 
+
+if torch.cuda.is_available():
+    device = "cuda"
+    print("Computation is running on gpu")
+else:
+    device = "cpu"
+    print("Computation is running on cpu")
 
 config = GPTConfig()
 model = GPT(config)
 model.eval()
-model.to('cuda')
-# def count_parameters(model):
-#     total = sum(p.numel() for p in model.parameters())
-#     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-#     print(f"Total parameters: {total:,}")
-#     print(f"Trainable parameters: {trainable:,}")
+model.to(device)
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total:,}")
+    print(f"Trainable parameters: {trainable:,}")
 
-# # Usage
-# count_parameters(model)
+# Usage
+count_parameters(model)
 # -----------------------------------------------------------------------------------------------------------
-num_return_sequences = 5
-max_length = 30
-
-#prefix tokenizer
+#Loading Data
 import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello,I'm a language model")
-tokens = torch.tensor(tokens,dtype=torch.long) #(B,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences,1) #(5,8)
-x = tokens.to('cuda')
-#------------------------------------------------------------------------------------------------------------
 
+class DataLoaderLite:
+    def __init__(self,B,T):
+        self.B = B
+        self.T = T
+        # at init load tokens from disk and store them in memory
+        with open("data/input.txt","r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2') 
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens,dtype = torch.long)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
+        self.current_position = 0
+    def next_batch(self):
+        B,T = self.B,self.T
+        buffer_text =self.tokens[self.current_position: self.current_position+B*T+1]
+        x = (buffer_text[:-1]).view(B,T) #inputs
+        y = (buffer_text[1:]).view(B,T) #targets
+        self.current_position += B*T
+        #if loading the next batch would be out of bounds, reset
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+# -----------------------------------------------------------------------------------------------------------
+#Training Loop
+
+train_loader = DataLoaderLite(B=4,T=1000)
+optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4)
+for i in range(10):
+    x,y =train_loader.next_batch()
+    x,y = x.to(device),y.to(device)
+    optimizer.zero_grad()
+    logits,loss = model(x,y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+import sys
+sys.exit(0)
+#------------------------------------------------------------------------------------------------------------
 #generation code Block
 torch.manual_seed(2909)
 torch.cuda.manual_seed(2909)
@@ -136,10 +198,11 @@ while x.size(1)<max_length:
         logits = model(x) #(B,T,vocal_size)
         # taking last token since its prediction from our model
         logits = logits[:,-1,:] #(B,vocab_size)
+        
         probs = F.softmax(logits,dim=-1)
         #taking top-k sampling from the output
         # here k = 50, hence top 50 -> (5,50)
-        topk_probs,topk_indices = torch.topk(probs,50,dim=-1) 
+        topk_probs,topk_indices = torch.topk(probs,50,dim=-1)
         #select the token from the topk probabilities
         ix = torch.multinomial(topk_probs,1) #(B,1)
         #gather the corrresponding indices
