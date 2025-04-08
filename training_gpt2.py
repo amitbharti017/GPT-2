@@ -7,7 +7,8 @@ import math
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # Maximum sequence length
-    vocab_size: int = 50257 # Number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50304 # Number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    #we are having number of vocab_size higher than GPT2 to have higher efficiency while computation
     n_layer: int = 12 #number of layers
     n_head: int = 12 #number of heads
     n_embd: int = 768 #embedding dimension
@@ -37,11 +38,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
         q = q.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
         v = v.view(B,T,self.n_head,C // self.n_head).transpose(1,2) #(B, nh, T, hs)
-        att = (q @ k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1))) # where k.size(-1) is the head dimension 
-        # shape of attention will be (B, nh, T, T)
-        att = att.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
-        att = F.softmax(att,dim=-1)
-        y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        #below 4 lines of code is replaced by flashhed attention for higher computational efficiency
+        # att = (q @ k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1))) # where k.size(-1) is the head dimension 
+        # # shape of attention will be (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
+        # att = F.softmax(att,dim=-1)
+        # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1,2).contiguous().view(B,T,C) # re-assemble all head outputs side by side
         y = self.c_proj(y) 
         #Each head learns to focus on different aspects (e.g., syntax, long-term dependencies, etc.) c_proj gives the model the ability to mix the heads in a trainable way.
@@ -132,21 +136,24 @@ else:
     device = "cpu"
     print("Computation is running on cpu")
 
+torch.set_float32_matmul_precision('high')
 config = GPTConfig()
 model = GPT(config)
 model.eval()
 model.to(device)
-def count_parameters(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total:,}")
-    print(f"Trainable parameters: {trainable:,}")
+# model = torch.compile(model)
+# def count_parameters(model):
+#     total = sum(p.numel() for p in model.parameters())
+#     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     print(f"Total parameters: {total:,}")
+#     print(f"Trainable parameters: {trainable:,}")
 
-# Usage
-count_parameters(model)
+# # Usage
+# count_parameters(model)
 # -----------------------------------------------------------------------------------------------------------
 #Loading Data
 import tiktoken
+import time
 
 class DataLoaderLite:
     def __init__(self,B,T):
@@ -176,15 +183,23 @@ class DataLoaderLite:
 #Training Loop
 
 train_loader = DataLoaderLite(B=4,T=1000)
-optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4)
+optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4,betas=(0.9,0.95),eps=1e-8)
 for i in range(10):
+    t0 = time.time()
     x,y =train_loader.next_batch()
     x,y = x.to(device),y.to(device)
     optimizer.zero_grad()
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16):
     logits,loss = model(x,y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+    #It clips the gradients during backpropagation to prevent them from getting too large (aka exploding gradients). Gradient clipping limits the total norm (magnitude) of gradients to a safe threshold.
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1=time.time()
+    dt = (t1-t0)*1000
+    tokens_per_second = (train_loader.B*train_loader.T)/(t1-t0)
+    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}tok/sec")
 
 import sys
 sys.exit(0)
